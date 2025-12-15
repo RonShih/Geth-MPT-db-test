@@ -22,12 +22,16 @@ package leveldb
 
 import (
 	"bytes"
+	"encoding/csv"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -83,6 +87,11 @@ type Database struct {
 	quitChan chan chan error // Quit channel to stop the metrics collection before closing the database
 
 	log log.Logger // Contextual logger tracking the database path
+
+	// CASTLE: CSV logger for dumping all LevelDB operations
+	kvLogFile *os.File
+	kvLogger  *csv.Writer
+	kvLogLock sync.Mutex
 }
 
 // New returns a wrapped LevelDB object. The namespace is the prefix that the
@@ -134,6 +143,32 @@ func NewCustom(file string, namespace string, customize func(options *opt.Option
 		log:      logger,
 		quitChan: make(chan chan error),
 	}
+
+	// CASTLE: Initialize CSV logger for LevelDB operations
+	// Check if file exists to determine if we need to write header
+	csvPath := "leveldb_operations.csv"
+	fileExists := false
+	if _, err := os.Stat(csvPath); err == nil {
+		fileExists = true
+	}
+
+	// Open file in append mode (O_APPEND | O_CREATE | O_WRONLY)
+	csvFile, err := os.OpenFile(csvPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logger.Warn("Failed to open LevelDB operations CSV", "err", err)
+	} else {
+		ldb.kvLogFile = csvFile
+		ldb.kvLogger = csv.NewWriter(csvFile)
+		// Write header only if file is new
+		if !fileExists {
+			ldb.kvLogger.Write([]string{"Operation", "KeyHex", "ValueHex", "KeySize", "ValueSize", "Type"})
+			ldb.kvLogger.Flush()
+			logger.Info("LevelDB operations logging enabled (new file)", "file", csvPath)
+		} else {
+			logger.Info("LevelDB operations logging enabled (append mode)", "file", csvPath)
+		}
+	}
+
 	ldb.compTimeMeter = metrics.NewRegisteredMeter(namespace+"compact/time", nil)
 	ldb.compReadMeter = metrics.NewRegisteredMeter(namespace+"compact/input", nil)
 	ldb.compWriteMeter = metrics.NewRegisteredMeter(namespace+"compact/output", nil)
@@ -181,6 +216,18 @@ func (db *Database) Close() error {
 		}
 		db.quitChan = nil
 	}
+
+	// CASTLE: Close CSV logger
+	if db.kvLogger != nil {
+		db.kvLogLock.Lock()
+		db.kvLogger.Flush()
+		db.kvLogFile.Close()
+		db.kvLogger = nil
+		db.kvLogFile = nil
+		db.kvLogLock.Unlock()
+		db.log.Info("LevelDB operations logging closed")
+	}
+
 	return db.db.Close()
 }
 
@@ -189,22 +236,154 @@ func (db *Database) Has(key []byte) (bool, error) {
 	return db.db.Has(key, nil)
 }
 
+// detectKeyType detects the type of key for logging purposes.
+// Returns: "PATH_ACCOUNT_TRIE", "PATH_STORAGE_TRIE", "HASH_TRIE", "SNAPSHOT_ACCOUNT", "SNAPSHOT_STORAGE", or ""
+func (db *Database) detectKeyType(key []byte, value []byte) string {
+	if len(key) == 0 {
+		return ""
+	}
+
+	// Check path-scheme account trie node ('A' prefix)
+	if rawdb.IsAccountTrieNode(key) {
+		return "PATH_ACCOUNT_TRIE"
+	}
+
+	// Check path-scheme storage trie node ('O' prefix)
+	if rawdb.IsStorageTrieNode(key) {
+		return "PATH_STORAGE_TRIE"
+	}
+
+	// Check snapshot account ('a' prefix)
+	if bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) {
+		return "SNAPSHOT_ACCOUNT"
+	}
+
+	// Check snapshot storage ('o' prefix)
+	if bytes.HasPrefix(key, rawdb.SnapshotStoragePrefix) {
+		return "SNAPSHOT_STORAGE"
+	}
+
+	// Check hash-scheme legacy trie node (32 bytes key, key == hash(value))
+	if rawdb.IsLegacyTrieNode(key, value) {
+		return "HASH_TRIE"
+	}
+
+	return ""
+}
+
+// detectKeyTypeWithoutValue detects the type of key without value (for DELETE operations).
+// Can only detect prefix-based types, cannot detect HASH_TRIE without value.
+func (db *Database) detectKeyTypeWithoutValue(key []byte) string {
+	if len(key) == 0 {
+		return ""
+	}
+
+	// Check path-scheme account trie node ('A' prefix)
+	if rawdb.IsAccountTrieNode(key) {
+		return "PATH_ACCOUNT_TRIE"
+	}
+
+	// Check path-scheme storage trie node ('O' prefix)
+	if rawdb.IsStorageTrieNode(key) {
+		return "PATH_STORAGE_TRIE"
+	}
+
+	// Check snapshot account ('a' prefix)
+	if bytes.HasPrefix(key, rawdb.SnapshotAccountPrefix) {
+		return "SNAPSHOT_ACCOUNT"
+	}
+
+	// Check snapshot storage ('o' prefix)
+	if bytes.HasPrefix(key, rawdb.SnapshotStoragePrefix) {
+		return "SNAPSHOT_STORAGE"
+	}
+
+	// For 32-byte keys, assume HASH_TRIE (can't verify without value)
+	if len(key) == common.HashLength {
+		return "HASH_TRIE"
+	}
+
+	return ""
+}
+
 // Get retrieves the given key if it's present in the key-value store.
 func (db *Database) Get(key []byte) ([]byte, error) {
 	dat, err := db.db.Get(key, nil)
 	if err != nil {
 		return nil, err
 	}
+
+	// CASTLE: Log GET operation with type detection
+	if db.kvLogger != nil && len(key) > 0 && len(dat) > 0 {
+		keyType := db.detectKeyType(key, dat)
+		if keyType != "" {
+			db.kvLogLock.Lock()
+			keyHex := hex.EncodeToString(key)
+			valueHex := hex.EncodeToString(dat)
+			db.kvLogger.Write([]string{
+				"GET",
+				keyHex,
+				valueHex,
+				fmt.Sprintf("%d", len(key)),
+				fmt.Sprintf("%d", len(dat)),
+				keyType,
+			})
+			db.kvLogger.Flush()
+			db.kvLogLock.Unlock()
+		}
+	}
+
 	return dat, nil
 }
 
 // Put inserts the given value into the key-value store.
 func (db *Database) Put(key []byte, value []byte) error {
+	// CASTLE: Log PUT operation with type detection
+	if db.kvLogger != nil && len(key) > 0 && len(value) > 0 {
+		keyType := db.detectKeyType(key, value)
+		if keyType != "" {
+			db.kvLogLock.Lock()
+			keyHex := hex.EncodeToString(key)
+			valueHex := hex.EncodeToString(value)
+			db.kvLogger.Write([]string{
+				"PUT",
+				keyHex,
+				valueHex,
+				fmt.Sprintf("%d", len(key)),
+				fmt.Sprintf("%d", len(value)),
+				keyType,
+			})
+			db.kvLogger.Flush()
+			db.kvLogLock.Unlock()
+		}
+	}
+
 	return db.db.Put(key, value, nil)
 }
 
 // Delete removes the key from the key-value store.
 func (db *Database) Delete(key []byte) error {
+	// CASTLE: Log DELETE operation
+	// Note: We can't detect type for DELETE since we don't have the value
+	// We'll try to detect based on key only (prefix check)
+	if db.kvLogger != nil && len(key) > 0 {
+		keyType := db.detectKeyTypeWithoutValue(key)
+		if keyType != "" {
+			db.kvLogLock.Lock()
+			keyHex := hex.EncodeToString(key)
+			db.kvLogger.Write([]string{
+				"DELETE",
+				keyHex,
+				"", // No value for DELETE
+				fmt.Sprintf("%d", len(key)),
+				"0", // No value size
+				keyType,
+			})
+			db.kvLogger.Flush()
+			db.kvLogLock.Unlock()
+		}
+	}
+
 	return db.db.Delete(key, nil)
 }
 
@@ -240,16 +419,18 @@ func (db *Database) DeleteRange(start, end []byte) error {
 // database until a final write is called.
 func (db *Database) NewBatch() ethdb.Batch {
 	return &batch{
-		db: db.db,
-		b:  new(leveldb.Batch),
+		db:     db.db,
+		b:      new(leveldb.Batch),
+		parent: db, // CASTLE: Pass parent for logging
 	}
 }
 
 // NewBatchWithSize creates a write-only database batch with pre-allocated buffer.
 func (db *Database) NewBatchWithSize(size int) ethdb.Batch {
 	return &batch{
-		db: db.db,
-		b:  leveldb.MakeBatch(size),
+		db:     db.db,
+		b:      leveldb.MakeBatch(size),
+		parent: db, // CASTLE: Pass parent for logging
 	}
 }
 
@@ -443,9 +624,10 @@ func (db *Database) meter(refresh time.Duration, namespace string) {
 // batch is a write-only leveldb batch that commits changes to its host database
 // when Write is called. A batch cannot be used concurrently.
 type batch struct {
-	db   *leveldb.DB
-	b    *leveldb.Batch
-	size int
+	db     *leveldb.DB
+	b      *leveldb.Batch
+	size   int
+	parent *Database // CASTLE: Reference to parent for logging
 }
 
 // Put inserts the given value into the batch for later committing.
@@ -478,12 +660,33 @@ func (b *batch) DeleteRange(start, end []byte) error {
 	defer it.Release()
 
 	var count int
+
 	for it.Next() {
 		count++
 		key := it.Key()
 		if count > 10000 { // should not block for more than a second
 			return ethdb.ErrTooManyKeys
 		}
+
+		// CASTLE: Log each DELETE operation to CSV with type detection
+		if b.parent != nil && b.parent.kvLogger != nil && len(key) > 0 {
+			keyType := b.parent.detectKeyTypeWithoutValue(key)
+			if keyType != "" {
+				b.parent.kvLogLock.Lock()
+				keyHex := hex.EncodeToString(key)
+				b.parent.kvLogger.Write([]string{
+					"DELETE",
+					keyHex,
+					"",
+					fmt.Sprintf("%d", len(key)),
+					"0",
+					keyType,
+				})
+				b.parent.kvLogger.Flush()
+				b.parent.kvLogLock.Unlock()
+			}
+		}
+
 		// Add this key to the batch for deletion
 		b.b.Delete(key)
 		b.size += len(key)
@@ -501,6 +704,14 @@ func (b *batch) ValueSize() int {
 
 // Write flushes any accumulated data to disk.
 func (b *batch) Write() error {
+	// CASTLE: Log all batch operations using Replay
+	if b.parent != nil && b.parent.kvLogger != nil {
+		logger := &batchLogger{
+			parent: b.parent,
+		}
+		b.b.Replay(logger)
+	}
+
 	return b.db.Write(b.b, nil)
 }
 
@@ -550,6 +761,76 @@ func (r *replayer) DeleteRange(start, end []byte) {
 		r.failure = rangeDeleter.DeleteRange(start, end)
 	} else {
 		r.failure = errors.New("ethdb.KeyValueWriter does not implement DeleteRange")
+	}
+}
+
+// CASTLE: batchLogger logs batch operations to CSV
+type batchLogger struct {
+	parent *Database
+}
+
+// Put logs a PUT operation from batch with type detection
+func (bl *batchLogger) Put(key, value []byte) {
+	if bl.parent.kvLogger != nil && len(key) > 0 && len(value) > 0 {
+		keyType := bl.parent.detectKeyType(key, value)
+		if keyType != "" {
+			bl.parent.kvLogLock.Lock()
+			keyHex := hex.EncodeToString(key)
+			valueHex := hex.EncodeToString(value)
+			bl.parent.kvLogger.Write([]string{
+				"PUT",
+				keyHex,
+				valueHex,
+				fmt.Sprintf("%d", len(key)),
+				fmt.Sprintf("%d", len(value)),
+				keyType,
+			})
+			bl.parent.kvLogger.Flush()
+			bl.parent.kvLogLock.Unlock()
+		}
+	}
+}
+
+// Delete logs a DELETE operation from batch with type detection
+func (bl *batchLogger) Delete(key []byte) {
+	if bl.parent.kvLogger != nil && len(key) > 0 {
+		keyType := bl.parent.detectKeyTypeWithoutValue(key)
+		if keyType != "" {
+			bl.parent.kvLogLock.Lock()
+			keyHex := hex.EncodeToString(key)
+			bl.parent.kvLogger.Write([]string{
+				"DELETE",
+				keyHex,
+				"",
+				fmt.Sprintf("%d", len(key)),
+				"0",
+				keyType,
+			})
+			bl.parent.kvLogger.Flush()
+			bl.parent.kvLogLock.Unlock()
+		}
+	}
+}
+
+// DeleteRange logs a DELETE_RANGE operation from batch with type detection
+func (bl *batchLogger) DeleteRange(start, end []byte) {
+	if bl.parent.kvLogger != nil && len(start) > 0 {
+		keyType := bl.parent.detectKeyTypeWithoutValue(start)
+		if keyType != "" {
+			bl.parent.kvLogLock.Lock()
+			startHex := hex.EncodeToString(start)
+			endHex := hex.EncodeToString(end)
+			bl.parent.kvLogger.Write([]string{
+				"DELETE_RANGE",
+				startHex,
+				endHex,
+				fmt.Sprintf("%d", len(start)),
+				fmt.Sprintf("%d", len(end)),
+				keyType,
+			})
+			bl.parent.kvLogger.Flush()
+			bl.parent.kvLogLock.Unlock()
+		}
 	}
 }
 

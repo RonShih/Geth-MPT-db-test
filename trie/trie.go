@@ -19,12 +19,19 @@ package trie
 
 import (
 	"bytes"
+	"encoding/csv"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"unsafe" // CASTLE: For tracking memory sizes
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics" // CASTLE: For tracking disk I/O stats
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
@@ -57,6 +64,96 @@ type Trie struct {
 
 	// tracer is the tool to track the trie changes.
 	tracer *tracer
+}
+
+// CASTLE: Global query statistics
+var (
+	ValueNodeCountperGet int
+	ShortNodeCountperGet int
+	FullNodeCountperGet  int
+	HashNodeCountperGet  int
+
+	ValueNodeBytesperGet int64
+	ShortNodeBytesperGet int64
+	FullNodeBytesperGet  int64
+	HashNodeBytesperGet  int64
+
+	SysReadCountperGet int64
+	SysReadbytesperGet int64 // by rchar in Linux
+	DBDiskReadperGet   int64 // by db read
+)
+
+// CASTLE: CSV writer for logging trie query statistics
+var (
+	csvFile   *os.File
+	csvWriter *csv.Writer
+	csvMutex  sync.Mutex
+	csvInited bool
+)
+
+// CASTLE: Initialize CSV file for logging
+func initCSVLogger() error {
+	csvMutex.Lock()
+	defer csvMutex.Unlock()
+
+	if csvInited {
+		return nil
+	}
+
+	var err error
+	csvFile, err = os.OpenFile("trie_stats.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+
+	csvWriter = csv.NewWriter(csvFile)
+
+	// Write header if file is new
+	stat, _ := csvFile.Stat()
+	if stat.Size() == 0 {
+		header := []string{
+			"Operation", "Key",
+			"ValueNodeCount", "ShortNodeCount", "FullNodeCount", "HashNodeCount",
+			"ValueNodeBytes", "ShortNodeBytes", "FullNodeBytes", "HashNodeBytes",
+			"SysReadCount", "SysReadBytes", "SysActualReadBytes",
+			"DBDiskRead",
+		}
+		csvWriter.Write(header)
+		csvWriter.Flush()
+	}
+
+	csvInited = true
+	return nil
+}
+
+// CASTLE: Write trie query stats to CSV
+func writeTrieStatsToCSV(operation string, key []byte) {
+	if err := initCSVLogger(); err != nil {
+		log.Warn("Failed to initialize CSV logger", "err", err)
+		return
+	}
+
+	csvMutex.Lock()
+	defer csvMutex.Unlock()
+
+	record := []string{
+		operation,
+		hex.EncodeToString(key),
+		strconv.Itoa(ValueNodeCountperGet),
+		strconv.Itoa(ShortNodeCountperGet),
+		strconv.Itoa(FullNodeCountperGet),
+		strconv.Itoa(HashNodeCountperGet),
+		strconv.FormatInt(ValueNodeBytesperGet, 10),
+		strconv.FormatInt(ShortNodeBytesperGet, 10),
+		strconv.FormatInt(FullNodeBytesperGet, 10),
+		strconv.FormatInt(HashNodeBytesperGet, 10),
+		strconv.FormatInt(SysReadCountperGet, 10),
+		strconv.FormatInt(SysReadbytesperGet, 10),
+		strconv.FormatInt(DBDiskReadperGet, 10),
+	}
+
+	csvWriter.Write(record)
+	csvWriter.Flush()
 }
 
 // newFlag returns the cache flag value for a newly created node.
@@ -149,10 +246,28 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if t.committed {
 		return nil, ErrCommitted
 	}
+
+	// CASTLE: Initialize global statistics before each query
+	ValueNodeCountperGet = 0
+	ShortNodeCountperGet = 0
+	FullNodeCountperGet = 0
+	HashNodeCountperGet = 0
+	ValueNodeBytesperGet = int64(0)
+	ShortNodeBytesperGet = int64(0)
+	FullNodeBytesperGet = int64(0)
+	HashNodeBytesperGet = int64(0)
+	SysReadCountperGet = int64(0)
+	SysReadbytesperGet = int64(0)
+	DBDiskReadperGet = int64(0)
+
 	value, newroot, didResolve, err := t.get(t.root, keybytesToHex(key), 0)
 	if err == nil && didResolve {
 		t.root = newroot
 	}
+
+	// CASTLE: Write statistics to CSV after query completes
+	writeTrieStatsToCSV("MPT_GET", key)
+
 	return value, err
 }
 
@@ -160,11 +275,19 @@ func (t *Trie) get(origNode node, key []byte, pos int) (value []byte, newnode no
 	switch n := (origNode).(type) {
 	case nil:
 		return nil, nil, false, nil
+
 	case valueNode:
+		// CASTLE: Track memory read
+		ValueNodeCountperGet++
+		ValueNodeBytesperGet += int64(unsafe.Sizeof(n))
 		return n, n, false, nil
+
 	case *shortNode:
+		// CASTLE: Track memory read
+		ShortNodeCountperGet++
+		ShortNodeBytesperGet += int64(unsafe.Sizeof(n))
+
 		if !bytes.HasPrefix(key[pos:], n.Key) {
-			// key not found in trie
 			return nil, n, false, nil
 		}
 		value, newnode, didResolve, err = t.get(n.Val, key, pos+len(n.Key))
@@ -172,19 +295,41 @@ func (t *Trie) get(origNode node, key []byte, pos int) (value []byte, newnode no
 			n.Val = newnode
 		}
 		return value, n, didResolve, err
+
 	case *fullNode:
+		// CASTLE: Track memory read
+		FullNodeCountperGet++
+		FullNodeBytesperGet += int64(unsafe.Sizeof(n))
+
 		value, newnode, didResolve, err = t.get(n.Children[key[pos]], key, pos+1)
 		if err == nil && didResolve {
 			n.Children[key[pos]] = newnode
 		}
 		return value, n, didResolve, err
+
 	case hashNode:
+		// CASTLE: Track hash node resolution
+		HashNodeCountperGet++
+		var DiskstatsBefore metrics.DiskStats
+		var DiskstatsAfter metrics.DiskStats
+
+		// CASTLE: Track system-level disk stats (ignore errors on non-Linux systems)
+		_ = metrics.ReadDiskStats(&DiskstatsBefore)
+
 		child, err := t.resolveAndTrack(n, key[:pos])
+
+		// CASTLE: Track system-level disk stats after (ignore errors on non-Linux systems)
+		_ = metrics.ReadDiskStats(&DiskstatsAfter)
+
+		SysReadCountperGet += DiskstatsAfter.ReadCount - DiskstatsBefore.ReadCount
+		SysReadbytesperGet += DiskstatsAfter.ReadBytes - DiskstatsBefore.ReadBytes
+
 		if err != nil {
 			return nil, n, true, err
 		}
 		value, newnode, _, err := t.get(child, key, pos)
 		return value, newnode, true, err
+
 	default:
 		panic(fmt.Sprintf("%T: invalid node: %v", origNode, origNode))
 	}

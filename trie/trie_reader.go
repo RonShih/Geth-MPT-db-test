@@ -68,5 +68,9 @@ func (r *trieReader) node(path []byte, hash common.Hash) ([]byte, error) {
 	if err != nil || len(blob) == 0 {
 		return nil, &MissingNodeError{Owner: r.owner, NodeHash: hash, Path: path, err: err}
 	}
+
+	// CASTLE: Track total bytes read (includes both disk and cache hits)
+	DBDiskReadperGet += int64(len(blob))
+
 	return blob, nil
 }

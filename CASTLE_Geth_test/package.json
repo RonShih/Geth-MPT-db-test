@@ -1,0 +1,21 @@
+{
+  "name": "geth-leveldb-test",
+  "version": "1.0.0",
+  "description": "Geth LevelDB Performance Test",
+  "main": "Geth_rdm_usr_tx_test.js",
+  "scripts": {
+    "start": "node Geth_rdm_usr_tx_test.js",
+    "test": "node Geth_rdm_usr_tx_test.js"
+  },
+  "dependencies": {
+    "ethers": "^6.8.0"
+  },
+  "keywords": [
+    "geth",
+    "leveldb",
+    "ethereum",
+    "performance"
+  ],
+  "author": "Ron",
+  "license": "MIT"
+}
